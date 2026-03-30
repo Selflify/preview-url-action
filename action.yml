@@ -1,0 +1,115 @@
+name: Preview URL
+description: Resolve and optionally wait for a Selflify preview URL.
+
+inputs:
+  site:
+    required: true
+    description: Site name or subdomain managed by Selflify.
+  preview-base-domain:
+    required: true
+    description: Base domain used by Selflify, for example example.dev.
+  path-name:
+    required: false
+    description: Explicit preview path name. When omitted, it is derived from the current ref or pull request.
+    default: ''
+  wait-mode:
+    required: false
+    description: Preview readiness check mode.
+    default: exact-sha
+  timeout-seconds:
+    required: false
+    description: Maximum time to wait for preview readiness.
+    default: '600'
+  poll-interval-seconds:
+    required: false
+    description: Delay between readiness checks.
+    default: '5'
+
+outputs:
+  link:
+    description: Final preview URL.
+    value: ${{ steps.url.outputs.result }}
+  path-name:
+    description: Effective preview path name.
+    value: ${{ steps.path_name.outputs.result }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve path name
+      id: path_name
+      uses: actions/github-script@v7
+      with:
+        result-encoding: string
+        script: |
+          const explicitPathName = '${{ inputs.path-name }}';
+
+          if (explicitPathName) {
+            return explicitPathName;
+          }
+
+          const ref = context.ref || '';
+          const refName = ref
+            .replace(/^refs\/heads\//, '')
+            .replace(/^refs\/tags\//, '');
+
+          if (context.eventName === 'pull_request') {
+            return `pr-${context.payload.pull_request.number}`;
+          }
+
+          if (ref.startsWith('refs/tags/')) {
+            return refName.replace(/[/.]/g, '-');
+          }
+
+          if (refName === 'stable') {
+            return 'stable';
+          }
+
+          if (refName) {
+            return refName.replace(/[/.]/g, '-');
+          }
+
+          return 'stable';
+
+    - name: Resolve preview URL
+      id: url
+      uses: actions/github-script@v7
+      with:
+        result-encoding: string
+        script: |
+          const site = '${{ inputs.site }}';
+          const previewBaseDomain = '${{ inputs.preview-base-domain }}';
+          const pathName = '${{ steps.path_name.outputs.result }}';
+          return `https://${pathName}.${site}.${previewBaseDomain}`;
+
+    - name: Wait for preview readiness
+      shell: bash
+      run: |
+        wait_mode='${{ inputs.wait-mode }}'
+        deadline=$((SECONDS + ${{ inputs.timeout-seconds }}))
+        poll_interval='${{ inputs.poll-interval-seconds }}'
+
+        case "$wait_mode" in
+          exact-sha)
+            target_url="${{ steps.url.outputs.result }}/__preview_commit__/$GITHUB_SHA"
+            ;;
+          available)
+            target_url='${{ steps.url.outputs.result }}'
+            ;;
+          none)
+            exit 0
+            ;;
+          *)
+            echo "Unsupported preview wait mode: $wait_mode" >&2
+            exit 1
+            ;;
+        esac
+
+        until curl --fail --silent --show-error --location "$target_url" --output /dev/null; do
+          if (( SECONDS >= deadline )); then
+            echo "Preview is not available after ${{ inputs.timeout-seconds }} seconds ($wait_mode): $target_url" >&2
+            exit 1
+          fi
+
+          sleep "$poll_interval"
+        done
